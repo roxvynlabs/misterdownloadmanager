@@ -562,6 +562,47 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 These ship in the next version.
 
+- ✅ macOS: no more **The window stopped responding** report while a file dialog is open: the
+  time its window thread spends in a system Open or Save dialog isn't counted
+  ([#1192](https://github.com/anefzaoui/misterdownloadmanager/issues/1192))
+- ✅ The speed limit shows where the speed does: the progress window's Transfer rate names the
+  limit holding the download back (its own, the Speed Limiter's, or the one for all downloads),
+  the list's Transfer rate says it in its tip, and the status bar and the tray's tip say while the
+  Speed Limiter is on ([#1191](https://github.com/anefzaoui/misterdownloadmanager/issues/1191))
+- ✅ The window opens at once when an unfinished download is on a network share that doesn't
+  answer or a sleeping drive: downloads' progress, and a new video's name, are read beside it
+  (found with [#1170](https://github.com/anefzaoui/misterdownloadmanager/issues/1170))
+- ✅ macOS: MDM no longer closes when the displays change while it draws with OpenGL (a dock
+  and the lid closed): it takes its OpenGL context back when the system left its thread without
+  it, and a texture OpenGL still refuses is made on a later frame
+  ([#1173](https://github.com/anefzaoui/misterdownloadmanager/issues/1173))
+- ✅ **Offer to download links copied to the clipboard** no longer opens Download File Info again
+  for a link still on the clipboard after a moment another program held it
+  ([#1157](https://github.com/anefzaoui/misterdownloadmanager/issues/1157))
+- ✅ No freeze when downloads are deleted with their files: the rows go at once and the files are
+  deleted beside the window ([#1170](https://github.com/anefzaoui/misterdownloadmanager/issues/1170))
+- ✅ The window no longer waits for its crash monitor at start: the connection is made beside it,
+  a monitor slow to listen is connected to late, with what was sent meanwhile told again, and one
+  the system refuses for a while no longer ends the session's crash reports
+  ([#476](https://github.com/anefzaoui/misterdownloadmanager/issues/476))
+- ✅ **Stop All** stops the queues too: a running queue no longer starts its next download
+  ([#1164](https://github.com/anefzaoui/misterdownloadmanager/issues/1164))
+- ✅ macOS: closing the window leaves MDM running in the Dock, and a click on its icon there brings
+  the window back, menu bar icon or not; Cmd+Q quits
+- ✅ Windows: shutting down, restarting or signing out saves MDM as File → Exit does (its
+  downloads stop where they are and resume there, no crash report at the next start), and an
+  installer closing MDM through the Restart Manager closes it; File → Exit also stops the
+  downloads where they are
+- ✅ Linux: logging out or shutting down saves MDM as File → Exit does (its downloads stop where
+  they are and resume there, no crash report at the next start), whether the system asks it to end
+  or its display goes away first
+- ✅ No more **The window stopped responding** report in the first minutes after MDM starts with
+  the computer: as after a wake, a stall then is the computer's (logged, and reported only if it
+  lasts past the first three minutes)
+  (for [#1126](https://github.com/anefzaoui/misterdownloadmanager/issues/1126))
+- ✅ Link grabber's **Status** column: a failure whose sentence ends in advice shows that advice
+  in the column, with the whole sentence on hover, and the column is as wide as its longest answer
+  ([#1110](https://github.com/anefzaoui/misterdownloadmanager/issues/1110))
 - ✅ A malformed stream playlist no longer stops the video downloader: that download fails and
   says why ([#1141](https://github.com/anefzaoui/misterdownloadmanager/issues/1141))
 - ✅ A queue (or a download) set to **Exit Mister Download Manager when done** quits MDM, as File →
@@ -585,6 +626,8 @@ These ship in the next version.
   completion happens beside the window (for [#1103](https://github.com/anefzaoui/misterdownloadmanager/issues/1103))
 - ✅ A crash while checking for updates on some computers; a check that goes wrong says why
   ([#1123](https://github.com/anefzaoui/misterdownloadmanager/issues/1123))
+- ✅ Torrents: trackers at addresses that can't be on the internet are skipped
+- ✅ Declared videos: script text inside a script is not read as a declaration
 - ✅ Reading a page's text stops at the right closing tag
 - ✅ Torrents with a file and a folder of the same name are refused cleanly
 - ✅ Archive volumes with unusual letters in their names no longer close MDM
@@ -606,6 +649,10 @@ These ship in the next version.
 - ✅ A gallery of tens of thousands of files already in its folder no longer seems to hang: its
   files are listed in time linear in their number
   ([#1142](https://github.com/anefzaoui/misterdownloadmanager/issues/1142))
+- ✅ The notification-area icon is sharp beside the others: it is the hand-made picture of the
+  size the taskbar draws it at (16 px at 100 %, 24 at 150 %, 32 at 200 %), drawn again when the
+  display's scale changes, instead of the 256 px one Windows shrank
+  ([#1161](https://github.com/anefzaoui/misterdownloadmanager/issues/1161))
 - ✅ Tests: the checks that a long list is read in linear time, which still failed now and then on
   a busy macOS runner, time one input 16 times as long against 16 short ones (as many items, as
   long a run), take each side's fastest of several runs, and fail at three times as long (a square
@@ -638,6 +685,9 @@ These ship in the next version.
 - ✅ **Download File Info**: **...** beside **Save As** opens the system's Save dialog (the
   folder and the file name, the download's type listed), and the name typed there is the one
   saved ([#1088](https://github.com/anefzaoui/misterdownloadmanager/issues/1088))
+- ✅ **Download File Info**: **Yes** to the Save dialog's "Replace?" replaces that file under its
+  own name once the download is complete (it stays as it was until then); it was saved as
+  `name (1)` ([#1088](https://github.com/anefzaoui/misterdownloadmanager/issues/1088))
 - ✅ The browser's **Download all links** on a page with thousands of long links: the list goes to
   MDM in parts the browser lets through, and opens in Link grabber whole, as one list; past 1 MB of
   links nothing arrived
@@ -849,6 +899,11 @@ These ship in the next version.
   with Direct3D on Windows' own software renderer (WARP) instead, from then on, and **View → Draw
   with** says why; the reporter confirmed WARP draws it right
   ([#835](https://github.com/anefzaoui/misterdownloadmanager/issues/835))
+- ✅ System helper detection on Windows and Unix: yt-dlp, ffmpeg, gallery-dl and JS runtimes
+  (deno, node, quickjs, bun) are discovered across package managers (WinGet, Scoop, Chocolatey,
+  Homebrew, Flatpak, Nix), pip environments and standard directories; a bgutil Proof-of-Origin
+  Token (POT) provider the person already runs is detected (a server on 127.0.0.1:4416, a
+  `bgutil-pot` binary, an installed yt-dlp plugin), never downloaded or started by MDM
 - ✅ A helper (yt-dlp, ffmpeg, gallery-dl) that can't be downloaded says which server and why
   (not found, refused, no answer, a secure connection an antivirus or a proxy reads, GitHub's
   limit on requests, cut short) and what to do; its release list goes through the proxy set in
@@ -936,6 +991,9 @@ These ship in the next version.
   buttons again ([#620](https://github.com/anefzaoui/misterdownloadmanager/issues/620),
   [#772](https://github.com/anefzaoui/misterdownloadmanager/issues/772)): the progress window and
   the style themes' dialogs are framed as on Windows 11, without a hidden title bar
+- ✅ Windows: download progress on each download window's taskbar button, alongside the main
+  window's existing combined progress
+  ([#678](https://github.com/anefzaoui/misterdownloadmanager/issues/678))
 - ✅ Fast downloads to a hard disk keep going past the first gigabytes: no more freezes of 7 to
   10 s once the system's cache is full, and no connection replaced as "much slower" for waiting on
   the disk; a disk slower than the network slows the download down evenly
@@ -1032,6 +1090,10 @@ These ship in the next version.
   ([#449](https://github.com/anefzaoui/misterdownloadmanager/pull/449))
 - ✅ The progress window's bar glides instead of moving in steps
   ([#449](https://github.com/anefzaoui/misterdownloadmanager/pull/449))
+- ✅ The download speed shown is steady: an average of the last few seconds whatever the frame
+  rate, its figure (and the time left) changing twice a second, together in the list, the progress
+  window, the status bar and the tray's tip
+  ([#1176](https://github.com/anefzaoui/misterdownloadmanager/issues/1176))
 - ✅ A stream's qualities (HLS) show a size in the Download video window, estimated from their
   bitrate and the video's length
   ([#449](https://github.com/anefzaoui/misterdownloadmanager/pull/449))

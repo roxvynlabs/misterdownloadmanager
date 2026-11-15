@@ -1625,9 +1625,26 @@ pub fn fit(
     right: f32,
     salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> Rect {
-    let (rect, cut) = text_fit(p, x, baseline, s, color, right);
-    if cut {
-        full_on_hover(ui, rect, salt, s);
+    fit_whole(ui, p, x, baseline, s, s, color, right, salt)
+}
+
+/// [`fit`] for a cell that shows one text and tips another: the Link grabber's Status says a
+/// failure in words that fit, while the whole sentence (with the remedy) waits on hover.
+#[allow(clippy::too_many_arguments)]
+pub fn fit_whole(
+    ui: &Ui,
+    p: &Painter,
+    x: f32,
+    baseline: f32,
+    shown: &str,
+    full: &str,
+    color: Color32,
+    right: f32,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+) -> Rect {
+    let (rect, cut) = text_fit(p, x, baseline, shown, color, right);
+    if cut || shown != full {
+        full_on_hover(ui, rect, salt, full);
     }
     rect
 }
@@ -5080,6 +5097,16 @@ pub fn saved_name(was: &str, picked: &std::path::Path) -> std::path::PathBuf {
     picked.with_file_name(name)
 }
 
+/// Whether the system Save dialog's answer `picked`, made `saved` by [`saved_name`], replaces a
+/// file (#1088): a file is there, so the dialog asked "Replace?" about it and was answered Yes
+/// (Windows', the portal's and GTK's dialogs, zenity and macOS' panel all ask before they answer
+/// with a file that is there). Not when `saved_name` changed the name: the dialog asked nothing
+/// about that one, and a file there is kept (the download is numbered). Never a folder. On the
+/// dialog's thread: it looks at the disk.
+pub fn replaces_picked(picked: &std::path::Path, saved: &std::path::Path) -> bool {
+    picked == saved && picked.is_file()
+}
+
 /// A system file or folder dialog's answer, from its thread.
 type PickSlot = std::sync::Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
 
@@ -5156,7 +5183,9 @@ impl egui::Plugin for PickStarter {
 /// draws its menu, whose window closes only at the end of the next frame. On macOS the dialog
 /// runs in a modal loop on the app's main thread (rfd hands it there), which began before that
 /// frame: the menu's window stayed on top of every window until MDM quit. Every system dialog
-/// starts here, so every menu item that opens one closes its menus first, on every system.
+/// starts here, so every menu item that opens one closes its menus first, on every system. And
+/// each is counted open while it runs (`crash::system_dialog`): the freeze watchdog doesn't take
+/// the time macOS's window thread spends in it for a frozen window (#1192).
 pub fn start_pick(
     ctx: &egui::Context,
     key: &str,
@@ -5170,7 +5199,8 @@ pub fn start_pick(
     ctx.data_mut(|d| d.insert_temp(id, slot.clone()));
     let wake = ctx.clone();
     let job = move || {
-        let answer = ask();
+        // On macOS the window thread runs the dialog: its time there isn't a freeze (#1192).
+        let answer = crate::crash::system_dialog(ask);
         *slot.lock().unwrap() = Some(answer);
         wake.request_repaint();
     };
@@ -6672,6 +6702,61 @@ pub mod caption {
 mod tests {
     use super::*;
 
+    /// #1192: every system dialog `start_pick` shows is counted open while it runs (the freeze
+    /// watchdog doesn't take macOS's window thread in it for a frozen window), and closed once
+    /// answered, or when the code that shows it panics.
+    #[test]
+    fn a_picker_is_counted_open_while_it_runs() {
+        let _turn = crate::crash::DIALOG_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let frame = |ctx: &egui::Context| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
+        };
+        let waited = |what: &str, done: &mut dyn FnMut() -> bool| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < until, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        // Answered: open while its dialog runs, closed with the answer.
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_pick(&ctx, "test-1192", move || {
+            tx.send(crate::crash::dialogs_open()).unwrap();
+            Some(std::path::PathBuf::from("answer"))
+        });
+        assert_eq!(
+            crate::crash::dialogs_open(),
+            0,
+            "not before a frame starts it"
+        );
+        frame(&ctx);
+        let open = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(open, 1);
+        let mut answer = None;
+        waited("the answer", &mut || {
+            frame(&ctx);
+            answer = answer.take().or_else(|| picked(&ctx, "test-1192"));
+            answer.is_some()
+        });
+        assert_eq!(answer, Some(std::path::PathBuf::from("answer")));
+        assert_eq!(crate::crash::dialogs_open(), 0);
+        // Its code panics (its thread ends without an answer): closed all the same.
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_pick(&ctx, "test-1192-panic", move || {
+            tx.send(()).unwrap();
+            panic!("a dialog's code panics");
+        });
+        frame(&ctx);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        waited("closed after the panic", &mut || {
+            crate::crash::dialogs_open() == 0
+        });
+    }
+
     /// #1088: the name typed in Download File Info's Save dialog is the download's, its
     /// extension kept or replaced as typed, the same on every system.
     #[test]
@@ -6699,6 +6784,30 @@ mod tests {
         assert_eq!(saved("name. . "), dir.join("name.7z"));
         // A download without an extension adds none.
         assert_eq!(saved_name("README", &dir.join("notes")), dir.join("notes"));
+    }
+
+    /// #1088: the Save dialog's answer replaces a file only when it is the file the dialog asked
+    /// "Replace?" about: one that is there, under the name the dialog answered with.
+    #[test]
+    fn the_save_dialog_replaces_only_the_file_it_asked_about() {
+        let d = tempfile::tempdir().unwrap();
+        let was = "MPC-BE.1.9.3.x86.7z";
+        let answer = |name: &str| {
+            let picked = d.path().join(name);
+            replaces_picked(&picked, &saved_name(was, &picked))
+        };
+        std::fs::write(d.path().join("taken.7z"), b"old").unwrap();
+        std::fs::write(d.path().join("taken"), b"old").unwrap();
+        std::fs::create_dir(d.path().join("box.7z")).unwrap();
+        // There, the name as answered: asked about, and answered Yes.
+        assert!(answer("taken.7z"));
+        // Not there: nothing to replace.
+        assert!(!answer("new.7z"));
+        // `taken` (no extension) is there, but the download is saved as `taken.7z`: the dialog
+        // asked about `taken`, not about that one.
+        assert!(!answer("taken"));
+        // A folder is never replaced.
+        assert!(!answer("box.7z"));
     }
 
     /// `r` already gives the screen rect (mirrored in RTL); `rect` around it mirrors it back,
