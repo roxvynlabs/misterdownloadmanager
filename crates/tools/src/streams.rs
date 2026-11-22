@@ -21,9 +21,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
+use mdm_engine::browserlike::{self, Connection};
 use mdm_engine::download::{ConnView, SegmentView, State as DlState};
 use mdm_engine::{Destination, Download, Request, ServiceFault, Unlocked, Unlocker};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -74,6 +75,9 @@ pub struct Stream {
     /// yt-dlp's headers for it (`http_headers`) and the cookies it would send (`Cookie`).
     pub headers: Vec<(String, String)>,
     pub kind: Kind,
+    /// When the site serves it from (yt-dlp's `available_at`, Unix seconds): YouTube's servers
+    /// refuse a stream with 403 until the ad it plays before the video would end (#1655).
+    pub available_at: Option<u64>,
 }
 
 /// How a stream comes down.
@@ -105,6 +109,49 @@ impl Plan {
     pub fn total(&self) -> Option<u64> {
         self.streams.iter().map(|s| s.size).sum()
     }
+
+    /// When the site serves every stream of the choice from: the latest `available_at`, as
+    /// yt-dlp's downloader takes it of `requested_formats` before its first request.
+    pub fn available_at(&self) -> Option<u64> {
+        self.streams.iter().filter_map(|s| s.available_at).max()
+    }
+}
+
+/// How long until `at` (Unix seconds), when it is still ahead: counted from the second under
+/// way, as yt-dlp counts it (`available_at - int(time.time())`), so the wait ends at `at` or
+/// just after it, never before.
+fn until(at: Option<u64>, now: SystemTime) -> Option<Duration> {
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let left = at?.checked_sub(now)?;
+    (left > 0).then(|| Duration::from_secs(left))
+}
+
+/// The log's line for a wait of `left` until the site serves the streams (#1655).
+fn waiting_note(left: Duration) -> String {
+    format!(
+        "Waiting {} s before the streams, as the site requires (yt-dlp waits as long)",
+        left.as_secs()
+    )
+}
+
+/// Wait until the site serves the streams (`at`, yt-dlp's `available_at`; #1655), while
+/// `stopped` says no. True when Stop ended the wait.
+fn wait_until(at: Option<u64>, note: &dyn Fn(String), stopped: &dyn Fn() -> bool) -> bool {
+    let Some(left) = until(at, SystemTime::now()) else {
+        return false;
+    };
+    note(waiting_note(left));
+    let end = Instant::now() + left;
+    while let Some(rest) = end
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+    {
+        if stopped() {
+            return true;
+        }
+        std::thread::sleep(rest.min(Duration::from_millis(200)));
+    }
+    stopped()
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -260,6 +307,7 @@ fn stream(f: &Value, path: PathBuf) -> Result<Stream, Helper> {
         url,
         headers: headers_of(f),
         kind,
+        available_at: number(f, "available_at"),
     })
 }
 
@@ -374,7 +422,7 @@ impl Unlocker for StreamLink {
         &'a self,
         _url: &'a Url,
         note: &'a (dyn Fn(String, Option<f32>) + Send + Sync),
-        _cancel: &'a CancellationToken,
+        cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Option<Unlocked>, ServiceFault>> {
         Box::pin(async move {
             if let Some(u) = self.first.lock().unwrap().take() {
@@ -392,7 +440,19 @@ impl Unlocker for StreamLink {
                 .await
                 .map_err(|_| ServiceFault::Other("yt-dlp stopped".into()))?;
             match got.map(|f| stream_of(&f)) {
-                Ok(Some(s)) => Ok(Some(unlocked(s.url, &s.headers, self.size))),
+                Ok(Some(s)) => {
+                    // A new look-up's address is served from its own `available_at` (#1655).
+                    if let Some(left) = until(s.available_at, SystemTime::now()) {
+                        note(waiting_note(left), None);
+                        tokio::select! {
+                            _ = tokio::time::sleep(left) => {}
+                            _ = cancel.cancelled() => {
+                                return Err(ServiceFault::Other("stopped".into()));
+                            }
+                        }
+                    }
+                    Ok(Some(unlocked(s.url, &s.headers, self.size)))
+                }
                 Ok(None) => Err(ServiceFault::Other(format!(
                     "yt-dlp gave no address for format {}",
                     self.format_id
@@ -566,6 +626,7 @@ pub fn fetch(
     report: &dyn Report,
 ) -> Fetched {
     let mut known: Vec<Option<u64>> = vec![None; plan.streams.len()];
+    let mut waited = false;
     for (i, s) in plan.streams.iter().enumerate() {
         if report.stopped() {
             return Fetched::Stopped;
@@ -575,6 +636,16 @@ pub fn fetch(
         if !state.exists() && s.path.is_file() {
             known[i] = std::fs::metadata(&s.path).ok().map(|m| m.len());
             continue;
+        }
+        // Before the first request: the site refuses its streams until then (#1655). A run that
+        // continues takes its addresses afresh, each waiting for its own (`StreamLink`).
+        if !waited {
+            waited = true;
+            if wait_until(plan.available_at(), &|n| report.note(n), &|| {
+                report.stopped()
+            }) {
+                return Fetched::Stopped;
+            }
         }
         if let Some(dir) = s.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -601,6 +672,7 @@ pub fn fetch(
             opts.speak_as(ua.clone());
         }
         opts.agent_fallback = None;
+        opts.own_agent = None;
         opts.browser_final = None;
         opts.expected_type = None;
         opts.expected_size = None;
@@ -660,37 +732,66 @@ enum Unlisted {
     Failed(String),
 }
 
-/// The pieces of stream `s` (an HLS playlist fetched and read, DASH's as yt-dlp listed them).
+/// The pieces of stream `s` (an HLS playlist fetched and read, DASH's as yt-dlp listed them),
+/// and the browser-like connection when the playlist only came on it (#1289: its site's bot
+/// check refused MDM's own connection; its pieces then start on it).
 async fn list_pieces(
     s: &Stream,
     opts: &mdm_engine::Options,
-) -> Result<Vec<crate::pieces::Piece>, Unlisted> {
+) -> Result<(Vec<crate::pieces::Piece>, Option<Connection>), Unlisted> {
     use crate::pieces::Unlisted as U;
     let (extra, extra_key) = match &s.kind {
-        Kind::Dash(p) => return Ok(p.clone()),
+        Kind::Dash(p) => return Ok((p.clone(), None)),
         Kind::Hls { extra, extra_key } => (extra.as_deref(), extra_key.as_deref()),
         Kind::File { .. } => return Err(Unlisted::Failed("not a stream in pieces".into())),
     };
     let failed = |e: String| Unlisted::Failed(format!("the playlist: {e}"));
+    let headers = header_map(&s.headers);
     let client = mdm_engine::http_client(opts, &s.url).map_err(|e| failed(e.to_string()))?;
     let resp = client
         .get(s.url.clone())
-        .headers(header_map(&s.headers))
+        .headers(headers.clone())
         .send()
         .await
         .map_err(|e| failed(e.to_string()))?;
-    if !resp.status().is_success() {
+    let refused = !resp.status().is_success();
+    let (base, text, browser) = if refused
+        && browserlike::AVAILABLE
+        && browserlike::refuses_programs(resp.status(), resp.headers())
+    {
+        // Asked once more the way a browser connects, as a download's file is (#668).
+        let status = resp.status();
+        let refusal = || failed(format!("the server answered {status}"));
+        let b = Connection::new(opts, &s.url, &headers).map_err(|_| refusal())?;
+        let cancel = CancellationToken::new();
+        let mut answer = b
+            .get(s.url.clone(), headers, &cancel)
+            .await
+            .map_err(|_| refusal())?;
+        if !answer.status.is_success() {
+            return Err(refusal());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = answer.chunk().await.map_err(|e| failed(e.to_string()))? {
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&body).into_owned();
+        (answer.url.clone(), text, Some(b))
+    } else if refused {
         return Err(failed(format!("the server answered {}", resp.status())));
-    }
-    // Its pieces' addresses are taken from where it ended up, as hlsnative takes them.
-    let base = resp.url().clone();
-    let text = resp.text().await.map_err(|e| failed(e.to_string()))?;
-    crate::pieces::hls(&text, &base, extra, extra_key).map_err(|e| match e {
+    } else {
+        // Its pieces' addresses are taken from where it ended up, as hlsnative takes them.
+        let base = resp.url().clone();
+        let text = resp.text().await.map_err(|e| failed(e.to_string()))?;
+        (base, text, None)
+    };
+    let pieces = crate::pieces::hls(&text, &base, extra, extra_key).map_err(|e| match e {
         U::Live => Unlisted::Helper(Helper::Live),
         U::Protected(_) => Unlisted::Helper(Helper::Protected),
         U::NoPieces => Unlisted::Failed("the playlist lists no pieces".into()),
         U::BadIv => Unlisted::Failed("the playlist gives a key a malformed IV".into()),
-    })
+    })?;
+    Ok((pieces, browser))
 }
 
 /// Stream `i` of `plan`, in pieces: listed, downloaded several at once into its pieces' folder
@@ -706,28 +807,33 @@ fn fetch_pieces(
     report: &dyn Report,
 ) -> Fetched {
     let s = &plan.streams[i];
-    let list = match engine.handle.block_on(list_pieces(s, &engine.opts)) {
+    let (list, browser) = match engine.handle.block_on(list_pieces(s, &engine.opts)) {
         Ok(l) => l,
         Err(Unlisted::Helper(why)) => return Fetched::Helper(why),
         Err(Unlisted::Failed(e)) => return Fetched::Failed(e),
     };
     let n = list.len();
+    let token = CancellationToken::new();
     let relist: crate::pieces::Relist = {
         let (relink, id, opts) = (relink.clone(), s.format_id.clone(), engine.opts.clone());
-        let handle = engine.handle.clone();
+        let (handle, stop) = (engine.handle.clone(), token.clone());
         Arc::new(move || {
             let f = relink(&id)?;
             let s =
                 stream_of(&f).ok_or_else(|| format!("yt-dlp gave no address for format {id}"))?;
+            // The new list is served from its own look-up's `available_at` (#1655).
+            if wait_until(s.available_at, &|_| {}, &|| stop.is_cancelled()) {
+                return Err("stopped".into());
+            }
             handle
                 .block_on(list_pieces(&s, &opts))
+                .map(|(pieces, _)| pieces)
                 .map_err(|e| match e {
                     Unlisted::Failed(e) => e,
                     Unlisted::Helper(h) => h.english(),
                 })
         })
     };
-    let token = CancellationToken::new();
     *current.pieces.lock().unwrap() = Some(token.clone());
     current.busy.store(true, Ordering::Release);
     let shared = Arc::new(crate::pieces::Shared::default());
@@ -740,6 +846,7 @@ fn fetch_pieces(
         token.clone(),
         shared.clone(),
         relist,
+        browser,
     ));
     let mut cancelled = false;
     while !task.is_finished() {
@@ -947,6 +1054,61 @@ mod tests {
         let mut bare = one.clone();
         bare.as_object_mut().unwrap().remove("protocol");
         assert!(plan(&bare).is_ok());
+    }
+
+    /// #1655: each format's `available_at` (yt-dlp's, from the ad YouTube plays ahead of the
+    /// video); the choice is served from the latest of its streams', as yt-dlp waits for it.
+    #[test]
+    fn a_choice_is_served_from_its_latest_streams_time() {
+        let mut f = youtube();
+        assert_eq!(
+            plan(&f).unwrap().available_at(),
+            None,
+            "none given: no wait"
+        );
+        f["requested_formats"][0]["available_at"] = json!(1795296791);
+        f["requested_formats"][1]["available_at"] = json!(1795296795.0);
+        let p = plan(&f).unwrap();
+        assert_eq!(p.streams[0].available_at, Some(1795296791));
+        assert_eq!(p.streams[1].available_at, Some(1795296795));
+        assert_eq!(p.available_at(), Some(1795296795));
+        // A choice of one format: its own fields.
+        let one = json!({"format_id": "18", "ext": "mp4", "protocol": "https",
+            "filename": "/v/a.mp4", "url": "https://rr1---sn-a.googlevideo.com/videoplayback",
+            "available_at": 1795296791});
+        assert_eq!(plan(&one).unwrap().available_at(), Some(1795296791));
+    }
+
+    /// Counted from the second under way, as yt-dlp counts it: the wait never ends before `at`.
+    #[test]
+    fn the_wait_until_a_stream_is_served() {
+        let at = |s: u64, ms: u64| UNIX_EPOCH + Duration::from_secs(s) + Duration::from_millis(ms);
+        assert_eq!(until(None, at(100, 0)), None);
+        assert_eq!(until(Some(100), at(100, 500)), None, "its time has come");
+        assert_eq!(until(Some(90), at(100, 0)), None, "long past");
+        assert_eq!(until(Some(105), at(100, 0)), Some(Duration::from_secs(5)));
+        assert_eq!(until(Some(105), at(100, 999)), Some(Duration::from_secs(5)));
+        // Stop ends a wait at once; no time given, nothing is waited for or said.
+        let said = std::cell::RefCell::new(Vec::new());
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let begun = Instant::now();
+        assert!(wait_until(
+            Some(far),
+            &|n| said.borrow_mut().push(n),
+            &|| true
+        ));
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        assert!(
+            said.borrow()[0].starts_with("Waiting 3"),
+            "{:?}",
+            said.borrow()
+        );
+        assert!(!wait_until(None, &|n| said.borrow_mut().push(n), &|| false));
+        assert_eq!(said.borrow().len(), 1);
     }
 
     #[test]
